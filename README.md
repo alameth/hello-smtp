@@ -60,14 +60,20 @@ bounce address (MAIL FROM), and one or more recipients.
 <DD>Stop immediately (abort) if any recipients are rejected.  Normally the
    client will continue to send to the valid recipients.
 
+<DT>-c
+<DD><B>For server testing only: Do not use on live servers.</B>
+   Continue to attempt to send the message body even if all recipients are rejected.
+   This option causes the client to violate RFC 5321; a standard client will quit
+   the sessions when none of the recipients are valid.
+   
 <DT>-d
 <DD>Disconnect between sending multiple messages.
-  Normally a single connection is used to send all messages.
+   Normally a single connection is used to send all messages.
 
 <DT>-e
 <DD>Supress the default end-of-line normalization. This option should only be used
-  for server testing as the effect can be unpredictable on messages bodies that are not
-  fully normalized.
+   for server testing as the effect can be unpredictable on messages bodies that are not
+   fully normalized.
   
 <DT>-h
 <DD>Print the manual page and then stop
