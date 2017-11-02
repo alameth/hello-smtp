@@ -6,11 +6,15 @@ Fellow programmers have often asked me to share these little programs with them,
 ## Specification (man page)
 
 ### SYNOPSIS
-   smtp [options] server mail_from rcpt1 [ rcpt2 ... rcptn ]
+`   smtp [options] server mail_from rcpt1 [ rcpt2 ... rcptn ]`
+
 or:
-   smtp [options] -s server -f mailfrom -r rcptto msg1 ... msgn
+
+`   smtp [options] -s server -f mailfrom -r rcptto msg1 ... msgn`
+
 or:
-   smtp [options] -s server -F msg1 ... msgn
+
+`   smtp [options] -s server -F msg1 ... msgn`
 
 The first form is the historic form and generally the most useful when
 sending a single message that has a large number of recipients, e.g., a
@@ -22,8 +26,8 @@ risk of inadvertant spamming.
 
 ### DESCRIPTION
 This script reads one or more fully-formed RFC-2822 messages and submits
-them to the specified SMTP server.  The return address (`MAIL` `FROM`)
-and recipient addresses (`RCPT` `TO`) may be specified using command line
+them to the specified SMTP server.  The return address (`MAIL FROM`)
+and recipient addresses (`RCPT TO`) may be specified using command line
 options, or extracted from the message header.  Options are available
 to support opportunitistic or mandatory TLS, and SMTP login (`SMTP` `AUTH`).
 End-of-line characters are fully normalized to RFC-5321 requirements, so
