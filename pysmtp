@@ -1,0 +1,350 @@
+#!/usr/bin/python3
+""" ===========================================================================
+
+pysmtp -- Submit a fully-formed RFC-2822 message from the command line
+
+SYNOPSIS
+        pysmtp [ options ] -s server -f mailfrom -r rcptto msg1 ... msgn
+    or
+        pysmtp [ options ] -s server -F msg1 ... msgn
+
+DESCRIPTION
+    This script reads one or more fully-formed RFC-2822 messages and submits
+    them to the specified SMTP server.  The return address (MAIL FROM)
+    and recipient addresses (RCPT TO) may be specified using command line
+    options, or extracted from the message header.  Options are available
+    to support opportunitistic or mandatory TLS, and SMTP login (SMTP AUTH).
+
+    By default newlines are fully normalized per Python's usual handling of
+    text files.  Normalization can be disabled using the -e option; in this
+    case the message file must have correct RFC-5321 CRLF line termination.
+
+COPYING
+    Copyright 2017 by Carl S. Gutekunst csg at alameth dot org
+
+    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    not use this file except in compliance with the License.  You may obtain
+    a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+    License for the specific language governing permissions and limitations
+    under the License.
+
+TODO
+    - Implement command line format 1
+    - When no files given, read from stdin
+    - Cipherstring setting (-C option)
+    - Certificate verification (-V option)
+    - More flexability over what to do with errors (-A option)
+    - If User (-U) is present but password (-P) is not, prompt for password
+
+BUGS
+    The -d option (disconnect between messages) doesn't work if the message
+    is rejected at MAIL FROM or RCPT TO.  This is my own careless coding.
+
+    8BITMIME content (e.g., ISO-8859-1) can only be sent reliably using the
+    -e option, which opens the input file in binary mode.  Such files *must*
+    have proper CRLF end-of-line termination.
+
+    smtplib handles errors on EHLO poorly, discarding the error (which most
+    likely contains root cause) and retrying with HELO even on errors other
+    than 500.  (This is a common bug across many language libraries.)
+
+
+=========================================================================== """
+
+import sys
+import argparse
+import smtplib
+import email.utils
+from email.parser import HeaderParser
+
+argp = argparse.ArgumentParser(
+        description="Submit a fully-formed RFC-2822 message via SMTP")
+
+# General Options
+argp.add_argument("-a", "--abort_msg", action="store_true",
+        help="Stop (abort) message if any recipients are rejected")
+#argp.add_argument("-A", "--abort_all", action="store_true",
+#        help="Stop (abort) entire session on any and all errors")
+argp.add_argument("-d", "--disconnect", action="store_true",
+        help="Disconnect between messages")
+argp.add_argument("-e", "--noeol", action="store_true",
+        help="Do not normalize end-of-line characters (binary mode)")
+argp.add_argument("-f", "--mailfrom", metavar="address",
+        help="MAIL FROM address")
+argp.add_argument("-F", "--from_header", action="store_true",
+        help="Get MAIL FROM and RCPT TO from message header")
+argp.add_argument("-H", "--helo", metavar="heloname",
+        help="HELO name (default is FQDN of running host)")
+argp.add_argument("-p", "--port", type=int, default=25, metavar="port",
+        help="Port number (default is 25)")
+argp.add_argument("-r", "--rcpt", action="append", metavar="address",
+        help="RCPT TO addresses")
+argp.add_argument("-s", "--server", metavar="hostname", required=True,
+        help="SMTP server (required)")
+argp.add_argument("-t", "--trace", action="store_true",
+        help="Trace the conversation")
+
+# SMTP AUTH options
+argp.add_argument("-P", "--password", metavar="password",
+        help="Password for SMTP AUTH")
+argp.add_argument("-U", "--username", metavar="name",
+        help="Username for SMTP AUTH")
+
+# Transport Layer Security (TLS) Options
+argp.add_argument("-M", "--mandatory_tls", action="store_true",
+        help="Use STARTTLS to encrypt the conversation (mandatory)")
+argp.add_argument("-T", "--starttls", action="store_true",
+        help="Use STARTTLS to encrypt the conversation (opportunistic")
+#argp.add_argument("-C", "--ciphers",
+#        help="Explicitly set the TLS cipherstring")
+#argp.add_argument("-V", "--verify", action="store_true",
+#        help="Verify the identity of the server")
+
+# Positional Arguments: messages to send.
+#
+argp.add_argument("msgfiles", nargs="*", help="Filenames of RFC-2822 messages to send")
+
+# Parse and check command line
+#
+# Since there can only be one MAIL FROM, we assume that if someone gives both
+# -F and -f they are confused.  However, if they give both -F and -r, then
+# recipients from the command line are added to those from the header.
+#
+args = argp.parse_args()
+
+if args.from_header and args.mailfrom:
+    print("Only one of -F and -f options can be specified", file=sys.stderr)
+    sys.exit(-1)
+
+if not args.from_header and not args.mailfrom:
+    print("No MAIL FROM address: One of -f or -F options is required",
+            file=sys.stderr)
+    sys.exit(-1)
+
+if not args.from_header and not args.rcpt:
+    print("No RCPT TO addresses: One of -r or -F options is required",
+            file=sys.stderr)
+    sys.exit(-1)
+
+if args.password and not args.username:
+    print("The -P option requires the -U option", file=sys.stderr)
+    sys.exit(-1)
+
+# Instantiate the SMTP object, but take no other action.  Connection happens
+# inside the loop so we can enable debugging/tracing before connect, and so
+# we can decide whether to disconnect/connect between messages.
+#
+smtp = smtplib.SMTP()
+if args.trace:
+    smtp.set_debuglevel(1)
+
+# Kludge to work around Issue25852: the SMTP._host variable is only set in
+# the constructor, but is used in the starttls() method.  If we don't set it
+# by hand, we'll emit an illegal SMTP ClientHello that the server will reject.
+#
+smtp._host = args.server
+
+# OK, here we go: send messages one at a time.
+#
+isConnected = False
+for onefile in args.msgfiles:
+
+    # Slurp the entire message content into memory.  In string mode, the read()
+    # method and the SMTP client library perform end-of-line normalization; in
+    # binary mode, neither does.  Note that the error checks for file existance
+    # and minimum length are performed before connecting.
+    #
+    try:
+        if args.noeol:
+            with open(onefile, "rb") as contentfile:
+                content = contentfile.read()
+        else:
+            with open(onefile, "rt") as contentfile:
+                content = contentfile.read()
+    except Exception as inst:
+        print("Open failed:", inst, file=sys.stderr)
+        continue
+
+    if len(content) < 100:
+        print("Message content is implausibly short", file=sys.stderr)
+        continue
+
+    # Set the mailfrom and the list of recipients for this one message.  There
+    # can only be one mailfrom address, so only the one in the header or the
+    # command line can be used.  Multiple recipients are fine, though, so the
+    # header and command line lists are merged.
+    #
+    # NOTE: email.utils.getaddresses returns a 2-tuple that includes the phrase
+    #       field and the address; we only want the address.
+    #
+    thismsg_rcpts = []
+    if args.from_header:
+        headerparser = HeaderParser()
+        header = headerparser.parsestr(content)
+        thismsg_mailfrom = email.utils.parseaddr(header['from'])[1]
+        all_header_rcpts = email.utils.getaddresses(header.get_all('to', []) +
+            header.get_all('cc', []) + header.get_all('bcc', []))
+        thismsg_rcpts += [r[1] for r in all_header_rcpts]   # Extract address
+    else:
+        thismsg_mailfrom = args.mailfrom
+
+    if args.rcpt:
+        thismsg_rcpts += args.rcpt
+
+    # These error checks should only be necessary when reading the mailfrom
+    # and recipients from the header, since the same checks are performed
+    # earlier in the command line parse.  But the insurance is cheap.
+    #
+    if not thismsg_mailfrom:
+        print("Message has no sender address:", onefile, file=sys.stderr)
+        continue
+    if not thismsg_rcpts:
+        print("Message has no recipients:", onefile, file=sys.stderr)
+        continue
+
+    # If we aren't already connected to the server, do so now, including
+    # STARTTLS and SMTP AUTH, if they were requested.
+    #
+    # All connection errors are considered fatal and call sys.exit()
+    #
+    if not isConnected:
+        try:
+            (rcode, rtext) = smtp.connect(host=args.server, port=args.port)
+        except Exception as inst:
+            print("Connection to", args.server, "failed:", inst, file=sys.stderr)
+            sys.exit(1)
+        if rcode != 220:
+            print("Server", args.server, "rejected connection: ",
+                    rcode, rtext.decode('ASCII'), file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            (rcode, rtext) = smtp.ehlo(name=args.helo)
+        except Exception as inst:
+            print("EHLO to", args.server, "failed:", inst, file=sys.stderr)
+            sys.exit(1)
+        if rcode != 250:
+            print("Server", args.server, "rejected EHLO:",
+                    rcode, rtext.decode('ASCII'), file=sys.stderr)
+            smtp.close()
+            sys.exit(1)
+
+        if not smtp.has_extn("STARTTLS") and args.mandatory_tls:
+            print("Mandatory TLS requested, but server", args.server,
+                    "does not support TLS", file=sys.stderr)
+            sys.exit(-1)
+
+        if (args.mandatory_tls or args.starttls) and smtp.has_extn("STARTTLS"):
+            try:
+                smtp.starttls()                 # Only returns if successful
+            except Exception as inst:
+                print("Starting TLS failed:", inst, file=sys.stderr)
+                sys.exit(1)
+            try:
+                (rcode, rtext) = smtp.ehlo(name=args.helo)
+            except Exception as inst:
+                print("EHLO after STARTTLS failed:", inst, file=sys.stderr)
+                smtp.close()
+                sys.exit(1)
+            if rcode != 250:
+                print("Server rejected EHLO after STARTTLS:",
+                        rcode, rtext.decode('ASCII'), file=sys.stderr)
+                smtp.close()
+                sys.exit(-1)
+
+        isConnected = True
+
+        if args.username:
+            try:
+                smtp.login(args.username, args.password) # Returns on success
+            except Exception as inst:
+                print("Login failed:", inst, file=sys.stderr)
+                smtp.close()
+                sys.exit(1)
+
+    # Send Addresses.  Error out on MAIL FROM failure; keep going on RCPT TO
+    # unless all recipients are rejected or the -a flag was set.
+    #
+    # TODO: It would be nice to include the message size here, but we don't
+    #       know the actual length yet because EOL normalization has not yet
+    #       been performed.
+    #
+    try:
+        (rcode, rtext) = smtp.mail(thismsg_mailfrom)
+    except Exception as inst:
+        print("MAIL FROM failed:", inst, file=sys.stderr)
+        smtp.close()
+        sys.exit(-1)
+    if rcode != 250:
+        print("Sender rejected:",
+                rcode, rtext.decode('ASCII'), file=sys.stderr)
+        continue
+
+    oneWasGood = False
+    abortThisMessage = False
+    for onercpt in thismsg_rcpts:
+        try:
+            (rcode, rtext) = smtp.rcpt(onercpt)
+        except Exception as inst:
+            print("RCPT TO failed:", inst, file=sys.stderr)
+            smtp.close()
+            sys.exit(-1)
+        if rcode != 250:
+            print("Recipient rejected:",
+                    rcode, rtext.decode('ASCII'), file=sys.stderr)
+            if (args.abort_msg):
+                abortThisMessage = True
+                break
+        else:
+            oneWasGood = True
+
+    if not oneWasGood:
+        print("Message has no valid recipients; skipping:", onefile, file=sys.stderr)
+    if not oneWasGood or abortThisMessage:
+        try:
+            smtp.rset()
+        except Exception as inst:
+            print("RSET failed:", inst, file=sys.stderr)
+            smtp.close()
+            sys.exit(-1)                # Something's really broken
+        continue
+
+    # Send the content.  The data() method raises an exception on network errors
+    # or when the response to the DATA command is not 354, so on this command
+    # alone we attempt to continue after an exception. The data() method does
+    # *not* check the response after the dot.
+    # 
+    try:
+        (rcode, rtext) = smtp.data(content)
+    except Exception as inst:
+        print("Sending message content failed:", inst, file=sys.stderr)
+        smtp.close()
+        isConnected = False
+        continue
+    if rcode != 250:
+        print("Server rejected message:",
+                rcode, rtext.decode('ASCII'), file=sys.stderr)
+        if rcode == 421:
+            smtp.close()
+            isConnected = False
+    else:
+        print("Sent:", rtext.decode('ASCII'), file=sys.stderr)
+
+    # By default, we reuse the same connection to send multiple messages.
+    # If requested, close the connection and re-open for the next message.
+    #
+    if args.disconnect:
+        try:
+            smtp.quit()
+        except Exception as inst:
+            print("QUIT failed:", inst, file=sys.stderr)
+        smtp.close()
+        isConnected = False
+
+quit(0)
